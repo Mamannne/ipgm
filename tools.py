@@ -93,6 +93,45 @@ class TransitionNet(nn.Module):
         scale = torch.tensor([32.0, 32.0, 3.0, 3.0]).to(x.device)
         x_norm = x / scale
         return self.net(x_norm)
+    
+class StructuredTransitionNet(nn.Module):
+    def __init__(self):
+        super().__init__()
+        # We only input Position & Velocity (4)
+        # We only output Velocity Update (2) -> Acceleration/Force
+        self.net = nn.Sequential(
+            nn.Linear(4, 64),
+            nn.ReLU(),
+            nn.Linear(64, 64),
+            nn.ReLU(),
+            nn.Linear(64, 2) # Outputting delta_vx, delta_vy
+        )
+        
+    def forward(self, x):
+        # x is [pos_x, pos_y, vel_x, vel_y]
+        
+        # 1. Separate Input
+        pos = x[:, :2]
+        vel = x[:, 2:]
+        
+        # 2. Normalization (Still important!)
+        # Scale pos by 32, vel by 3
+        x_norm = x / torch.tensor([32.0, 32.0, 3.0, 3.0]).to(x.device)
+        
+        # 3. Predict FORCES (Acceleration)
+        # "delta_vel" represents gravity + bounce reaction
+        delta_vel = self.net(x_norm) 
+        
+        # 4. Integrate Physics (The "Structure")
+        # New Velocity = Old Velocity + Delta (Network prediction)
+        new_vel = vel + delta_vel
+        
+        # New Position = Old Position + Old Velocity (Standard Physics)
+        # We DON'T ask the network to predict this. We trust Newton.
+        new_pos = pos + vel 
+        
+        # Recombine
+        return torch.cat([new_pos, new_vel], dim=1)
 
 
 # --- 3. ANIMATION HELPER ---
@@ -168,3 +207,70 @@ def animate_trajectories(ground_truth, estimates=None, labels=None, dt=0.02):
     anim = FuncAnimation(fig, update, frames=frames, interval=dt*1000, blit=True)
     plt.close() 
     return HTML(anim.to_jshtml())
+
+
+
+
+def compare_models(models,consistent = True):
+    # 1. Setup Simulation (consistent=True to Force a specific bounce for consistency)
+    if consistent:
+        sim = BouncingBallSim(pos_start=[15, 15], vel_start=[2.0, 1.0]) 
+    else:
+        sim = BouncingBallSim() 
+    data = [sim.step() for _ in range(100)]
+    observations = np.array([d[0] for d in data]) 
+    ground_truth = np.array([d[2] for d in data]) 
+    
+    estimates = {}
+    
+    for model in models:
+        # Check if Classical KF (PyKalman object)
+        if hasattr(model, 'filter'):
+            print("Running Classical KF...")
+            model.initial_state_mean = [observations[0, 0], observations[0, 1], 0, 0]
+            kf_mean, _ = model.filter(observations)
+            estimates[model] = kf_mean
+            
+        else:
+            # Deep KF Variants
+            print(f"Running Deep Model: {type(model).__name__}...")
+            dkf_est = []
+            
+            # --- FIX STARTS HERE ---
+            # Frame 0: We know Position, guess Velocity=0
+            # We must concatenate so it has shape (4,) matches the rest!
+            obs0_padded = np.concatenate([observations[0], [0, 0]])
+            dkf_est.append(obs0_padded) 
+            # --- FIX ENDS HERE ---
+            
+            # Frame 1: We calculate velocity from diff
+            init_vel = (observations[1] - observations[0])
+            current_state = torch.FloatTensor(np.concatenate([observations[1], init_vel]))
+            dkf_est.append(current_state.numpy()) 
+            
+            with torch.no_grad():
+                # Loop starting from index 2
+                for z in observations[2:]:
+                    # A. PREDICT
+                    if next(model.parameters()).is_cuda:
+                        current_state = current_state.to('cuda')
+                        
+                    prediction = model(current_state.unsqueeze(0)).squeeze(0)
+                    prediction = prediction.cpu() 
+                    
+                    # B. UPDATE (Coupled)
+                    z_tensor = torch.FloatTensor(z)
+                    pred_pos = prediction[:2]
+                    pred_vel = prediction[2:]
+                    
+                    residual = z_tensor - pred_pos
+                    
+                    corrected_pos = pred_pos + 0.2 * residual
+                    corrected_vel = pred_vel + 0.1 * residual
+                    
+                    current_state = torch.cat([corrected_pos, corrected_vel])
+                    dkf_est.append(current_state.numpy())
+            
+            estimates[model] = np.array(dkf_est)
+            
+    return ground_truth, observations, estimates
