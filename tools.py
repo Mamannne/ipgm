@@ -7,12 +7,23 @@ from IPython.display import HTML
 
 # --- 1. THE PHYSICS ENGINE ---
 class BouncingBallSim:
-    def __init__(self, size=32, r=3, v_start=1.5):
+    def __init__(self, size=32, r=3, pos_start=None, vel_start=None):
         self.size = size
         self.r = r
-        self.pos = np.array([size/2, size/2]) # Start middle
-        self.vel = np.array([v_start, v_start * 0.5]) # Moving diagonally
-        self.gravity = 0.05
+        
+        # If no position given, randomize it
+        if pos_start is None:
+            self.pos = np.random.rand(2) * (size - 2*r) + r
+        else:
+            self.pos = np.array(pos_start, dtype=float)
+            
+        # If no velocity given, randomize it
+        if vel_start is None:
+            self.vel = (np.random.rand(2) - 0.5) * 5
+        else:
+            self.vel = np.array(vel_start, dtype=float)
+            
+        self.gravity = -0.05
         
     def step(self):
         # 1. Physics (Linear Motion + Gravity)
@@ -21,11 +32,11 @@ class BouncingBallSim:
         
         # 2. Non-Linearity (The Bounce)
         # Hitting Right/Left Walls
-        if self.pos[0] + self.r >= self.size or self.pos[0] - self.r <= 0:
-            self.vel[0] *= -0.9 # Reverse and lose energy
+        if (self.pos[0] + self.r >= self.size and self.vel[0] > 0) or (self.pos[0] - self.r <= 0 and self.vel[0] < 0):
+            self.vel[0] *= -0.7 # Reverse and lose energy
         # Hitting Floor/Ceiling
-        if self.pos[1] + self.r >= self.size or self.pos[1] - self.r <= 0:
-            self.vel[1] *= -0.9
+        if (self.pos[1] + self.r >= self.size and self.vel[1] > 0) or (self.pos[1] - self.r <= 0 and self.vel[1] < 0):
+            self.vel[1] *= -0.7
             
         # 3. Generate Observation
         noisy_pos = self.pos + np.random.randn(2) * 0.5
