@@ -211,12 +211,13 @@ def animate_trajectories(ground_truth, estimates=None, labels=None, dt=0.02):
 
 
 
-def compare_models(models,consistent = True):
+def compare_models(models,consistent = True,sim = None):
     # 1. Setup Simulation (consistent=True to Force a specific bounce for consistency)
     if consistent:
         sim = BouncingBallSim(pos_start=[15, 15], vel_start=[2.0, 1.0]) 
     else:
-        sim = BouncingBallSim() 
+        if sim is None:
+            sim = BouncingBallSim()
     data = [sim.step() for _ in range(100)]
     observations = np.array([d[0] for d in data]) 
     ground_truth = np.array([d[2] for d in data]) 
@@ -255,17 +256,17 @@ def compare_models(models,consistent = True):
                     if next(model.parameters()).is_cuda:
                         current_state = current_state.to('cuda')
                         
-                    prediction = model(current_state.unsqueeze(0)).squeeze(0)
+                    prediction = model(current_state.unsqueeze(0)).squeeze(0)       # (pos_estimate,vel_estimate) size = (4,1)
                     prediction = prediction.cpu() 
                     
                     # B. UPDATE (Coupled)
-                    z_tensor = torch.FloatTensor(z)
+                    z_tensor = torch.FloatTensor(z)                                 # Observation (pos only) size = (2,1)
                     pred_pos = prediction[:2]
                     pred_vel = prediction[2:]
                     
                     residual = z_tensor - pred_pos
                     
-                    corrected_pos = pred_pos + 0.2 * residual
+                    corrected_pos = pred_pos + 0.2 * residual 
                     corrected_vel = pred_vel + 0.1 * residual
                     
                     current_state = torch.cat([corrected_pos, corrected_vel])
