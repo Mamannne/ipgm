@@ -4,6 +4,7 @@ import torch.nn as nn
 import matplotlib.pyplot as plt
 from matplotlib.animation import FuncAnimation
 from IPython.display import HTML
+import torch.nn.functional as F
 
 # --- 1. THE PHYSICS ENGINE ---
 class BouncingBallSim:
@@ -179,7 +180,7 @@ def animate_trajectories(ground_truth, estimates=None, labels=None, dt=0.02):
     
     balls_est = []
     lines_est = []
-    colors = ['red', 'blue', 'green']
+    colors = ['red', 'blue', 'green', 'orange', 'purple', 'cyan']
     
     for i, (est_x, est_y) in enumerate(est_data):
         c = colors[i % len(colors)]
@@ -211,61 +212,89 @@ def animate_trajectories(ground_truth, estimates=None, labels=None, dt=0.02):
 
 
 
-def compare_models(models,consistent = True,sim = None):
-    # 1. Setup Simulation (consistent=True to Force a specific bounce for consistency)
+def compare_models(models, consistent=True, sim=None):
+    # 1. Setup Simulation
     if consistent:
+        # Force a specific bounce for consistency
         sim = BouncingBallSim(pos_start=[15, 15], vel_start=[2.0, 1.0]) 
     else:
         if sim is None:
             sim = BouncingBallSim()
+            
+    # Generate 100 steps
     data = [sim.step() for _ in range(100)]
-    observations = np.array([d[0] for d in data]) 
-    ground_truth = np.array([d[2] for d in data]) 
+    observations = np.array([d[0] for d in data]) # (100, 2)
+    ground_truth = np.array([d[2] for d in data]) # (100, 2)
     
     estimates = {}
     
     for model in models:
-        # Check if Classical KF (PyKalman object)
-        if hasattr(model, 'filter'):
+        # --- CAS 1: KVAE (Nouveau) ---
+        # On vérifie le nom de la classe pour éviter les erreurs d'import
+        if type(model).__name__ == 'KVAE':
+            print("Running Deep Model: KVAE (Smoothing)...")
+            
+            # Le KVAE prend toute la séquence d'un coup (Batch=1, T=100, Dim=2)
+            obs_tensor = torch.FloatTensor(observations).unsqueeze(0) 
+            
+            # Gestion GPU
+            device = next(model.parameters()).device
+            obs_tensor = obs_tensor.to(device)
+                
+            with torch.no_grad():
+                # model.smooth retourne la reconstruction (1, T, 2)
+                recon = model.smooth(obs_tensor)
+                
+            # On stocke le résultat en numpy (T, 2)
+            estimates[model] = recon.squeeze(0).cpu().numpy()
+
+        # --- CAS 2: Filtre de Kalman Classique (PyKalman) ---
+        elif hasattr(model, 'filter'):
             print("Running Classical KF...")
+            # Init naive : on suppose vitesse nulle au début
             model.initial_state_mean = [observations[0, 0], observations[0, 1], 0, 0]
             kf_mean, _ = model.filter(observations)
             estimates[model] = kf_mean
             
+        # --- CAS 3: Modèles Deep "Pas à Pas" (DKF, SKF, TransitionNet) ---
         else:
-            # Deep KF Variants
-            print(f"Running Deep Model: {type(model).__name__}...")
+            print(f"Running Deep Model: {type(model).__name__} (Step-by-Step)...")
             dkf_est = []
             
-            # --- FIX STARTS HERE ---
-            # Frame 0: We know Position, guess Velocity=0
-            # We must concatenate so it has shape (4,) matches the rest!
+            # Frame 0: On connait la Position, on devine Vitesse=0
             obs0_padded = np.concatenate([observations[0], [0, 0]])
             dkf_est.append(obs0_padded) 
-            # --- FIX ENDS HERE ---
             
-            # Frame 1: We calculate velocity from diff
+            # Frame 1: On calcule la vitesse initiale par différence finie
             init_vel = (observations[1] - observations[0])
+            # État courant (4,) : [px, py, vx, vy]
             current_state = torch.FloatTensor(np.concatenate([observations[1], init_vel]))
             dkf_est.append(current_state.numpy()) 
             
+            # On vérifie si le modèle est sur GPU
+            is_cuda = next(model.parameters()).is_cuda
+            
             with torch.no_grad():
-                # Loop starting from index 2
+                # Boucle à partir de l'image 2
                 for z in observations[2:]:
                     # A. PREDICT
-                    if next(model.parameters()).is_cuda:
+                    if is_cuda:
                         current_state = current_state.to('cuda')
                         
-                    prediction = model(current_state.unsqueeze(0)).squeeze(0)       # (pos_estimate,vel_estimate) size = (4,1)
+                    # Le modèle prédit la prochaine étape à partir de l'état estimé précédent
+                    prediction = model(current_state.unsqueeze(0)).squeeze(0) 
                     prediction = prediction.cpu() 
                     
-                    # B. UPDATE (Coupled)
-                    z_tensor = torch.FloatTensor(z)                                 # Observation (pos only) size = (2,1)
+                    # B. UPDATE (Filtre "Manuel")
+                    z_tensor = torch.FloatTensor(z) # Observation actuelle (pos seulement)
                     pred_pos = prediction[:2]
                     pred_vel = prediction[2:]
                     
+                    # Calcul du résidu (Erreur de prédiction)
                     residual = z_tensor - pred_pos
                     
+                    # Correction simple (Gain fixe)
+                    # On corrige la position et un peu la vitesse
                     corrected_pos = pred_pos + 0.2 * residual 
                     corrected_vel = pred_vel + 0.1 * residual
                     
@@ -275,3 +304,253 @@ def compare_models(models,consistent = True,sim = None):
             estimates[model] = np.array(dkf_est)
             
     return ground_truth, observations, estimates
+
+
+
+import torch
+import torch.nn as nn
+import torch.nn.functional as F
+import numpy as np
+
+class KVAE(nn.Module):
+    def __init__(self, x_dim=2, a_dim=2, z_dim=4, K=3, hidden_dim=64, scale=32.0):
+        """
+        KVAE: Kalman Variational Auto-Encoder
+        
+        Args:
+            x_dim: Dimension de l'observation (2 pour x,y)
+            a_dim: Dimension de l'objet latent (disentangled representation)
+            z_dim: Dimension de l'état dynamique (LGSSM state)
+            K: Nombre d'experts dynamiques (pour gérer les rebonds)
+            scale: Facteur d'échelle pour normaliser les entrées (ex: 32.0 pour la boite)
+        """
+        super().__init__()
+        self.x_dim = x_dim
+        self.a_dim = a_dim
+        self.z_dim = z_dim
+        self.K = K
+        
+        # On enregistre l'échelle comme une constante du modèle
+        self.register_buffer('scale', torch.tensor(float(scale)))
+
+        # --- 1. VAE (OBSERVATION MODEL) ---
+        # Encoder : x (brut) -> a (latent)
+        self.encoder = nn.Sequential(
+            nn.Linear(x_dim, hidden_dim), nn.ReLU(),
+            nn.Linear(hidden_dim, hidden_dim), nn.ReLU(),
+            nn.Linear(hidden_dim, 2 * a_dim) # [mu, logvar]
+        )
+        
+        # Decoder : a (latent) -> x (brut)
+        self.decoder = nn.Sequential(
+            nn.Linear(a_dim, hidden_dim), nn.ReLU(),
+            nn.Linear(hidden_dim, hidden_dim), nn.ReLU(),
+            nn.Linear(hidden_dim, x_dim)
+        )
+        
+        # Bruit d'observation (fixé bas pour forcer la précision)
+        # log_sigma = -2.0 => sigma approx 0.13 pixel (une fois normalisé)
+        self.log_scale_x = nn.Parameter(torch.tensor(-2.0), requires_grad=False)
+
+        # --- 2. DYNAMICS PARAMETER NETWORK (LSTM) ---
+        # Prédit le poids des experts (alpha) à partir de l'histoire de 'a'
+        self.lstm = nn.LSTM(a_dim, hidden_dim, batch_first=True)
+        self.lstm_to_alpha = nn.Linear(hidden_dim, K)
+
+        # --- 3. LGSSM PARAMETERS (EXPERTS) ---
+        # Matrices de transition (A) et d'émission (C) pour chaque expert k
+        # Init: A proche de l'identité (mouvement fluide), C aléatoire petit
+        self.A_k = nn.Parameter(torch.randn(K, z_dim, z_dim) * 0.05 + torch.eye(z_dim).unsqueeze(0))
+        self.B_k = nn.Parameter(torch.zeros(K, z_dim))
+        self.C_k = nn.Parameter(torch.randn(K, a_dim, z_dim) * 0.1)
+        self.D_k = nn.Parameter(torch.zeros(K, a_dim))
+        
+        # Bruit de processus (Q) et d'état (R) - Appris
+        self.Q_logvar = nn.Parameter(torch.zeros(z_dim) - 3.0) 
+        self.R_logvar = nn.Parameter(torch.zeros(a_dim) - 3.0)
+        
+        # État initial p(z_0)
+        self.z0_mu = nn.Parameter(torch.zeros(z_dim))
+        self.z0_logvar = nn.Parameter(torch.zeros(z_dim))
+
+    def reparameterize(self, mu, logvar):
+        std = torch.exp(0.5 * logvar)
+        eps = torch.randn_like(std)
+        return mu + eps * std
+
+    def encode_x(self, x):
+        """ Encode x en a avec normalisation interne """
+        # x: (B, T, x_dim) dans [0, scale]
+        # Normalisation vers [0, 1] pour la stabilité du réseau
+        x_norm = x / self.scale
+        
+        B, T, _ = x_norm.shape
+        flat_x = x_norm.contiguous().view(B*T, -1)
+        out = self.encoder(flat_x)
+        mu, logvar = torch.chunk(out, 2, dim=-1)
+        return mu.view(B, T, -1), logvar.view(B, T, -1)
+
+    def decode_a(self, a):
+        """ Decode a en x avec dénormalisation """
+        # a: (B, T, a_dim)
+        B, T, _ = a.shape
+        flat_a = a.contiguous().view(B*T, -1)
+        out_norm = self.decoder(flat_a) # Sortie dans [0, 1] environ
+        
+        # Dénormalisation vers [0, scale]
+        out_scaled = out_norm.view(B, T, -1) * self.scale
+        return out_scaled
+
+    def get_mixture_parameters(self, alpha):
+        """ Mélange les matrices des experts selon les poids alpha """
+        # alpha: (B, T, K)
+        # A_k: (K, z, z) -> A_t: (B, T, z, z)
+        A_t = torch.einsum('btk,kzy->btzy', alpha, self.A_k)
+        B_t = torch.einsum('btk,kz->btz', alpha, self.B_k)
+        C_t = torch.einsum('btk,kaz->btaz', alpha, self.C_k)
+        D_t = torch.einsum('btk,ka->bta', alpha, self.D_k)
+        return A_t, B_t, C_t, D_t
+
+    def kalman_filter(self, a_obs, A, B_mat, C, D):
+        """ Filtre de Kalman Différentiable (Calcul de la Vraisemblance) """
+        B_size, T, _ = a_obs.shape
+        device = a_obs.device
+        
+        mu = self.z0_mu.unsqueeze(0).expand(B_size, -1)
+        Sigma = torch.diag(torch.exp(self.z0_logvar)).unsqueeze(0).expand(B_size, -1, -1)
+        Q = torch.diag(torch.exp(self.Q_logvar)).unsqueeze(0).expand(B_size, -1, -1)
+        R = torch.diag(torch.exp(self.R_logvar)).unsqueeze(0).expand(B_size, -1, -1)
+        
+        log_likelihood = 0.0
+        
+        for t in range(T):
+            # 1. Prediction
+            mu_pred = torch.bmm(A[:, t], mu.unsqueeze(-1)).squeeze(-1) + B_mat[:, t]
+            Sigma_pred = torch.bmm(torch.bmm(A[:, t], Sigma), A[:, t].transpose(1, 2)) + Q
+            
+            # 2. Update / Correction
+            # Projection dans l'espace 'a'
+            y_pred = torch.bmm(C[:, t], mu_pred.unsqueeze(-1)).squeeze(-1) + D[:, t]
+            
+            # Résidu
+            r_t = a_obs[:, t] - y_pred
+            S_t = torch.bmm(torch.bmm(C[:, t], Sigma_pred), C[:, t].transpose(1, 2)) + R
+            
+            # Gain de Kalman
+            S_inv = torch.inverse(S_t)
+            K_t = torch.bmm(torch.bmm(Sigma_pred, C[:, t].transpose(1, 2)), S_inv)
+            
+            # Mise à jour État
+            mu = mu_pred + torch.bmm(K_t, r_t.unsqueeze(-1)).squeeze(-1)
+            I = torch.eye(self.z_dim, device=device).unsqueeze(0).expand(B_size, -1, -1)
+            Sigma = torch.bmm(I - torch.bmm(K_t, C[:, t]), Sigma_pred)
+            
+            # 3. Log-Likelihood
+            log_det_S = torch.logdet(S_t)
+            quad_term = torch.sum(r_t.unsqueeze(1).bmm(S_inv) * r_t.unsqueeze(1), dim=-1).squeeze()
+            ll_step = -0.5 * (log_det_S + quad_term + self.a_dim * np.log(2 * np.pi))
+            log_likelihood += ll_step
+            
+        return log_likelihood
+
+    def forward(self, x):
+        """ Training Step: Retourne la Loss (Negative ELBO) """
+        B, T, _ = x.shape
+        
+        # 1. Encodage x -> a
+        mu_a, logvar_a = self.encode_x(x)
+        a_sample = self.reparameterize(mu_a, logvar_a)
+        
+        # 2. LSTM (Cerveau) : a -> alpha (Choix des experts)
+        # Shift causal: l'input t sert à prédire t+1
+        lstm_input = torch.cat([torch.zeros(B, 1, self.a_dim, device=x.device), a_sample[:, :-1, :]], dim=1)
+        lstm_out, _ = self.lstm(lstm_input)
+        alpha = F.softmax(self.lstm_to_alpha(lstm_out), dim=-1)
+        
+        # 3. Paramètres Dynamiques
+        A_t, B_t, C_t, D_t = self.get_mixture_parameters(alpha)
+        
+        # 4. Filtre de Kalman (Vraisemblance dynamique)
+        log_p_a_given_alpha = self.kalman_filter(a_sample, A_t, B_t, C_t, D_t)
+        
+        # 5. Reconstruction x -> x_rec
+        x_recon = self.decode_a(a_sample)
+        
+        # 6. Loss Calculation
+        # Reconstruction (MSE pondérée par le bruit sigma_x)
+        # Note: On divise par scale^2 implicitement si on considère l'erreur normalisée, 
+        # mais ici on calcule l'erreur brute.
+        recon_mse = torch.sum((x - x_recon)**2, dim=[1,2])
+        var_x = torch.exp(self.log_scale_x)**2 
+        # Pour que la loss soit cohérente avec les grandes valeurs (0-32), on adapte le terme
+        recon_loss = 0.5 * recon_mse / var_x 
+        
+        # Entropie (Régularisation)
+        entropy_q_a = 0.5 * torch.sum(1 + logvar_a, dim=[1,2])
+        
+        # ELBO = log p(x|a) + log p(a) - log q(a|x)
+        elbo = -recon_loss + log_p_a_given_alpha + entropy_q_a
+        
+        return -elbo.mean(), recon_loss.mean(), -log_p_a_given_alpha.mean()
+
+    @torch.no_grad()
+    def smooth(self, x):
+        """ Inference Step: Lissage de trajectoire """
+        # 1. Encodage
+        a_seq, _ = self.encode_x(x)
+        B, T, _ = a_seq.shape
+        device = x.device
+        
+        # 2. LSTM
+        lstm_in = torch.cat([torch.zeros(B, 1, self.a_dim, device=device), a_seq[:, :-1, :]], dim=1)
+        lstm_out, _ = self.lstm(lstm_in)
+        alpha = F.softmax(self.lstm_to_alpha(lstm_out), dim=-1)
+        
+        # 3. Paramètres
+        A, B_mat, C, D = self.get_mixture_parameters(alpha)
+        
+        # 4. Filtrage de Kalman sur la moyenne (Approximation du lissage)
+        mu = self.z0_mu.unsqueeze(0).expand(B, -1)
+        Sigma = torch.diag(torch.exp(self.z0_logvar)).unsqueeze(0).expand(B, -1, -1)
+        Q = torch.diag(torch.exp(self.Q_logvar)).unsqueeze(0).expand(B, -1, -1)
+        R = torch.diag(torch.exp(self.R_logvar)).unsqueeze(0).expand(B, -1, -1)
+        
+        smoothed_a = []
+        
+        for t in range(T):
+            # Predict
+            mu_pred = torch.bmm(A[:, t], mu.unsqueeze(-1)).squeeze(-1) + B_mat[:, t]
+            Sigma_pred = torch.bmm(torch.bmm(A[:, t], Sigma), A[:, t].transpose(1, 2)) + Q
+            
+            # Update
+            y_pred = torch.bmm(C[:, t], mu_pred.unsqueeze(-1)).squeeze(-1) + D[:, t]
+            r = a_seq[:, t] - y_pred
+            S = torch.bmm(torch.bmm(C[:, t], Sigma_pred), C[:, t].transpose(1, 2)) + R
+            K_gain = torch.bmm(torch.bmm(Sigma_pred, C[:, t].transpose(1, 2)), torch.inverse(S))
+            
+            mu = mu_pred + torch.bmm(K_gain, r.unsqueeze(-1)).squeeze(-1)
+            I = torch.eye(self.z_dim, device=device).unsqueeze(0).expand(B, -1, -1)
+            Sigma = torch.bmm(I - torch.bmm(K_gain, C[:, t]), Sigma_pred)
+            
+            # Projection vers 'a' (lissé)
+            a_smooth_t = torch.bmm(C[:, t], mu.unsqueeze(-1)).squeeze(-1) + D[:, t]
+            smoothed_a.append(a_smooth_t)
+            
+        smoothed_a = torch.stack(smoothed_a, dim=1)
+        
+        # 5. Décodage
+        return self.decode_a(smoothed_a)
+    
+def generate_trajectory_data(n_sequences=1000, T=50):
+    """
+    Generates sequences of shape (N, T, 2) for KVAE training using the existing BouncingBallSim.
+    """
+    sequences = []
+    for _ in range(n_sequences):
+        sim = BouncingBallSim() # Uses your existing class
+        seq = []
+        for _ in range(T):
+            obs, _, _ = sim.step()
+            seq.append(obs)
+        sequences.append(seq)
+    return torch.FloatTensor(np.stack(sequences, axis=0))
