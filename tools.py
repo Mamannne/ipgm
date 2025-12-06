@@ -5,6 +5,7 @@ import matplotlib.pyplot as plt
 from matplotlib.animation import FuncAnimation
 from IPython.display import HTML
 
+
 # --- 1. THE PHYSICS ENGINE ---
 class BouncingBallSim:
     def __init__(self, size=32, r=3, pos_start=None, vel_start=None):
@@ -275,3 +276,159 @@ def compare_models(models,consistent = True,sim = None):
             estimates[model] = np.array(dkf_est)
             
     return ground_truth, observations, estimates
+
+
+
+
+def animate_trajectories_with_temp(
+    ground_truth,
+    estimates=None,
+    labels=None,
+    true_temp=None,
+    est_temps=None,
+    dt=0.02
+):
+    """
+    Animate:
+      - Left: 2D position (same style as your original animation)
+      - Right: Temperature vs time for true and estimated temps.
+
+    ground_truth: (N, >=2) array (true pos + maybe more)
+    estimates: list of (N, >=2) arrays (est pos + maybe more) or None
+    true_temp: (N,) array of true temperature over time (optional)
+    est_temps: list of (N,) arrays of estimated temperature over time (optional)
+    """
+
+    # --- Helper to extract x,y from sequences ---
+    def parse_input(seq):
+        seq = np.array(seq)
+        if seq.ndim == 2 and seq.shape[1] >= 2 and seq.shape[0] > 2:
+            return seq[:, 0], seq[:, 1]  # take first two dims as x,y
+        elif seq.shape[0] == 2:
+            return seq[0], seq[1]
+        return seq
+
+    gt_x, gt_y = parse_input(ground_truth)
+
+    est_data = []
+    if estimates is not None:
+        if not isinstance(estimates, list):
+            estimates = [estimates]
+        for est in estimates:
+            est_data.append(parse_input(est))
+    else:
+        estimates = []
+    
+    if labels is None:
+        labels = [f"Est {i+1}" for i in range(len(est_data))]
+
+    # Temperature data
+    if true_temp is not None:
+        true_temp = np.asarray(true_temp)
+    if est_temps is None:
+        est_temps = []
+    else:
+        est_temps = [np.asarray(t) for t in (est_temps if isinstance(est_temps, list) else [est_temps])]
+
+    # --- Figure and axes ---
+    fig, (ax_pos, ax_temp) = plt.subplots(1, 2, figsize=(12, 5))
+    
+    # ---- Position subplot (left) ----
+    all_x = [gt_x] + [e[0] for e in est_data] if est_data else [gt_x]
+    all_y = [gt_y] + [e[1] for e in est_data] if est_data else [gt_y]
+    
+    all_x = np.concatenate(all_x)
+    all_y = np.concatenate(all_y)
+    
+    ax_pos.set_xlim(np.min(all_x) - 1, np.max(all_x) + 1)
+    ax_pos.set_ylim(np.min(all_y) - 1, np.max(all_y) + 1)
+    ax_pos.set_aspect('equal')
+    ax_pos.grid(True, alpha=0.3)
+    ax_pos.set_title("Trajectory")
+    
+    ball_gt, = ax_pos.plot([], [], 'o', color='black', markersize=8, label='Ground Truth')
+    line_gt, = ax_pos.plot([], [], '--', color='grey', alpha=0.5)
+    
+    balls_est = []
+    lines_est = []
+    colors = ['red', 'blue', 'green', 'orange', 'purple']
+    
+    for i, (est_x, est_y) in enumerate(est_data):
+        c = colors[i % len(colors)]
+        b, = ax_pos.plot([], [], 'o', color=c, markersize=8, label=labels[i])
+        l, = ax_pos.plot([], [], '-', color=c, alpha=0.5, linewidth=1)
+        balls_est.append(b)
+        lines_est.append(l)
+    
+    ax_pos.legend()
+
+    # ---- Temperature subplot (right) ----
+    N = len(gt_x)
+    time = np.arange(N) * dt
+
+    # Pre-plot static lines
+    temp_lines = []
+    temp_markers = []
+
+    if true_temp is not None:
+        ax_temp.plot(time, true_temp, 'k--', label='True T')
+        true_marker, = ax_temp.plot([], [], 'ko', markersize=6)
+        temp_markers.append(true_marker)
+    else:
+        true_marker = None
+
+    for i, T_est in enumerate(est_temps):
+        c = colors[i % len(colors)]
+        ax_temp.plot(time[:len(T_est)], T_est, color=c, alpha=0.6, label=f"{labels[i]} T" if i < len(labels) else f"Est {i+1} T")
+        m, = ax_temp.plot([], [], 'o', color=c, markersize=6)
+        temp_markers.append(m)
+
+    if true_temp is not None or est_temps:
+        all_T = []
+        if true_temp is not None:
+            all_T.append(true_temp)
+        for T_est in est_temps:
+            all_T.append(T_est)
+        all_T = np.concatenate(all_T)
+        ax_temp.set_ylim(np.min(all_T) - 0.5, np.max(all_T) + 0.5)
+    ax_temp.set_xlim(time[0], time[-1])
+    ax_temp.grid(True, alpha=0.3)
+    ax_temp.set_title("Temperature over time")
+    ax_temp.set_xlabel("time")
+    ax_temp.set_ylabel("T")
+
+    ax_temp.legend()
+
+    # --- Animation update ---
+    def update(frame):
+      # Position GT
+      ball_gt.set_data([gt_x[frame]], [gt_y[frame]])
+      line_gt.set_data(gt_x[:frame+1], gt_y[:frame+1])
+      
+      # Position estimates
+      for i, (est_x, est_y) in enumerate(est_data):
+          if frame < len(est_x):
+              balls_est[i].set_data([est_x[frame]], [est_y[frame]])
+              lines_est[i].set_data(est_x[:frame+1], est_y[:frame+1])
+      
+      # Temperature markers
+      marker_idx = 0
+      if true_temp is not None:
+          if frame < len(true_temp):
+              # wrap in lists so x,y are sequences
+              temp_markers[marker_idx].set_data([time[frame]], [true_temp[frame]])
+          marker_idx += 1
+      
+      for j, T_est in enumerate(est_temps):
+          if frame < len(T_est):
+              temp_markers[marker_idx].set_data([time[frame]], [T_est[frame]])
+          marker_idx += 1
+      
+      artists = [ball_gt, line_gt] + balls_est + lines_est + temp_markers
+      return artists
+
+
+    frames = len(gt_x)
+    anim = FuncAnimation(fig, update, frames=frames, interval=dt*1000, blit=True)
+    plt.close(fig)
+    return HTML(anim.to_jshtml())
